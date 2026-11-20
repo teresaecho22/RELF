@@ -11,7 +11,7 @@ Report : for every round, the two terms of Eq. (5):
            student loss = approximation error + target noise
          and two sample-quality distances at the student's own step count.
 
-Run    : python toy_pd_two_moons.py            (about 10 minutes on a 2-core CPU)
+Run    : python toy_pd_two_moons.py            (about 9 minutes on a 2-core CPU)
          python toy_pd_two_moons.py --seed 1   (repeat with other seeds)
 Output : fig1_two_moons_pd.png / .pdf and a table printed to the terminal.
 """
@@ -67,12 +67,17 @@ def velocity(net, z, t):
 
 # ---------------------------teacher training--------------------------------------- 
 def train_teacher(net, iters, bs, lr):
-    """Flow matching loss of Eq. (1): || v_theta(z_t, t) - (x - s eps) ||^2."""
+    """Flow matching loss of Eq. (1): || v_theta(z_t, t) - (x - s eps) ||^2.
+
+    t is logit-normal (mean 0, std 1). With uniform t, the 1 / (1 - t)^2 factor in the
+    velocity loss concentrates the loss near t = 1, and the 32-step teacher places
+    samples between the moons (off-data distance 0.068 instead of 0.017).
+    """
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters)
     for _ in range(iters):
         x = two_moons(bs)
-        t = torch.rand(bs, 1)
+        t = torch.sigmoid(torch.randn(bs, 1))
         eps = torch.randn_like(x)
         z = t * x + (1 - t) * S * eps
         loss = (velocity(net, z, t) - (x - S * eps)).pow(2).mean()
@@ -171,7 +176,7 @@ def quality(samples, data):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--teacher_iters", type=int, default=8000)
+    p.add_argument("--teacher_iters", type=int, default=16000)
     p.add_argument("--pd_iters", type=int, default=3000)
     p.add_argument("--long", type=int, default=4, help="longer-training factor for the last round")
     p.add_argument("--bs", type=int, default=1024)
@@ -198,15 +203,17 @@ def main():
             student = pd_round(teacher, n_student, grid, args.pd_iters, args.bs, lr=3e-4)
             loss, approx, noise = loss_terms(student, teacher, n_student, grid)
             q = quality(sample(student, args.n_eval, n_student), data)
-            print(f"{n_student:5d}   {loss:.4f}  {approx:.4f}  {noise:.4f}  {q[0]:.3f}     {q[1]:.3f}")
+            print(f"{n_student:5d}   {loss:.4f}  {approx:.4f}  {noise:.4f}  {q[0]:.3f}     {q[1]:.3f}", flush=True)
             last_teacher, teacher = teacher, student
         one_step[grid] = student
 
-        # longer training of the last round, same teacher
-        student_long = pd_round(last_teacher, 1, grid, args.long * args.pd_iters, args.bs, lr=3e-4)
-        loss, approx, noise = loss_terms(student_long, last_teacher, 1, grid)
-        q = quality(sample(student_long, args.n_eval, 1), data)
-        print(f"1 (x{args.long})  {loss:.4f}  {approx:.4f}  {noise:.4f}  {q[0]:.3f}     {q[1]:.3f}")
+        # longer training of the last round, same teacher (random grid only:
+        # with the fixed grid the loss is already close to zero)
+        if grid == "random":
+            student_long = pd_round(last_teacher, 1, grid, args.long * args.pd_iters, args.bs, lr=3e-4)
+            loss, approx, noise = loss_terms(student_long, last_teacher, 1, grid)
+            q = quality(sample(student_long, args.n_eval, 1), data)
+            print(f"1 (x{args.long})  {loss:.4f}  {approx:.4f}  {noise:.4f}  {q[0]:.3f}     {q[1]:.3f}", flush=True)
 
     # ----------------------Fig. 1-------------------------------------------- 
     panels = [

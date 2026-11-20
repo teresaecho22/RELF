@@ -1,23 +1,34 @@
-"""Toy check for the RELF proposal (Fig. 1).
+"""Toy version of ELF's progressive distillation (PD) on two-moons data.
 
-Data   : two moons (2-D).
-Model  : x-prediction flow model with ELF's parameterization (Eq. 1 of the proposal).
-PD     : progressive distillation 32 -> 16 -> 8 -> 4 -> 2 -> 1 steps (Eq. 2), run twice:
-           grid = "random": the teacher's interior sub-step time is sampled per example
-                            (this is what ELF's released distill_train_step does)
-           grid = "fixed" : the interior sub-step time is the midpoint, so the target
-                            is a deterministic function of the student's input
-Report : for every round, the two terms of Eq. (5):
-           student loss = approximation error + target noise
-         and two sample-quality distances at the student's own step count.
+The procedure follows ELF's released PD code (distillation branch,
+scripts/progressive_distillation.sh and src/distill_train_step.py):
 
-Run    : python toy_pd_two_moons.py            (about 9 minutes on a 2-core CPU)
-         python toy_pd_two_moons.py --seed 1   (repeat with other seeds)
+  * The teacher is the ORIGINAL flow model in every round.
+  * Round k trains a student with N_k steps (16, 8, 4, 2, 1). The student takes one
+    step of size h = 1 / N_k from z_{t_s}; the teacher takes T_k Euler sub-steps
+    (4, 8, 16, 32, 64) over the same interval, so h * T_k = 1/64 in every round.
+  * Round 1 starts from the teacher's weights, later rounds from the previous student.
+  * t_s = u * (1 - h) with u logit-normal; the teacher's interior sub-step times are
+    sorted logit-normal samples rescaled into [t_s, t_s + h], drawn per example.
+
+The script runs the curriculum twice:
+  grid = "random": interior sub-step times sampled per example (as in ELF's code)
+  grid = "fixed" : interior sub-step times fixed to the quantiles of the same
+                   logit-normal distribution, so the target is a deterministic
+                   function of the student's input
+and reports, for every round, the two terms of the regression loss on fresh inputs:
+  student loss = approximation error + target noise.
+
+Run    : python toy_pd_two_moons.py
 Output : fig1_two_moons_pd.png / .pdf and a table printed to the terminal.
+
+Differences from ELF: two dimensions, an MLP, no guidance, no self-conditioning,
+no decoding step, and deterministic Euler sampling for the final one-step student.
 """
 import argparse
 import copy
 import math
+import os
 
 import matplotlib
 matplotlib.use("Agg")
@@ -25,11 +36,14 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 
-S = 1.0        # noise scale s. ELF uses s = 2 in the denoising branch; 1 is enough in 2-D.
-T_EPS = 0.05   # lower bound on (1 - t) in the velocity, as in ELF's code (t_eps)
+S = 2.0                                   # noise scale of ELF's denoising branch
+T_EPS = 0.05                              # lower bound on (1 - t), ELF's t_eps
+P_MEAN, P_STD = -1.5, 0.8                 # ELF's logit-normal time distribution
+STUDENT_STEPS = (16, 8, 4, 2, 1)
+TEACHER_SUBSTEPS = (4, 8, 16, 32, 64)     # step size x sub-steps = 1/64 in every round
 
 
-# --------------------------------data--------------------------------------------- 
+# --------------------------------data---------------------------------------------
 def two_moons(n, noise=0.05):
     """n points from the two-moons distribution, centered and scaled to std ~ 1."""
     n_up = n // 2
@@ -41,7 +55,12 @@ def two_moons(n, noise=0.05):
     return (x - torch.tensor([0.5, 0.25])) / 0.7
 
 
-# --------------------------------model-------------------------------------------- 
+def logit_normal(*shape):
+    """t = sigmoid(N(P_MEAN, P_STD)), ELF's time distribution."""
+    return torch.sigmoid(torch.randn(*shape) * P_STD + P_MEAN)
+
+
+# --------------------------------model--------------------------------------------
 class Net(nn.Module):
     """x-prediction network: (z_t, t) -> x_hat."""
 
@@ -65,19 +84,14 @@ def velocity(net, z, t):
     return (net(z, t) - z) / (1 - t).clamp(min=T_EPS)
 
 
-# ---------------------------teacher training--------------------------------------- 
+# ---------------------------teacher training---------------------------------------
 def train_teacher(net, iters, bs, lr):
-    """Flow matching loss of Eq. (1): || v_theta(z_t, t) - (x - s eps) ||^2.
-
-    t is logit-normal (mean 0, std 1). With uniform t, the 1 / (1 - t)^2 factor in the
-    velocity loss concentrates the loss near t = 1, and the 32-step teacher places
-    samples between the moons (off-data distance 0.068 instead of 0.017).
-    """
+    """Flow matching loss of Eq. (1): || v_theta(z_t, t) - (x - s eps) ||^2."""
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters)
     for _ in range(iters):
         x = two_moons(bs)
-        t = torch.sigmoid(torch.randn(bs, 1))
+        t = logit_normal(bs, 1)
         eps = torch.randn_like(x)
         z = t * x + (1 - t) * S * eps
         loss = (velocity(net, z, t) - (x - S * eps)).pow(2).mean()
@@ -88,50 +102,49 @@ def train_teacher(net, iters, bs, lr):
     return net
 
 
-@torch.no_grad()
-def sample(net, n, steps):
-    """Deterministic Euler sampler on a uniform grid, from t = 0 (noise) to t = 1 (data)."""
-    z = S * torch.randn(n, 2)
-    ts = torch.linspace(0, 1, steps + 1)
-    for i in range(steps):
-        t = ts[i].expand(n, 1)
-        z = z + (ts[i + 1] - ts[i]) * velocity(net, z, t)
-    return z
+# -----------------------distillation-----------------------------------------------
+def sub_step_times(t_s, h, n_sub, grid):
+    """(B, n_sub + 1) times from t_s to t_s + h.
 
-
-# -----------------------distillation----------------------------------------------- 
-@torch.no_grad()
-def pd_target(teacher, z, t_s, h, grid):
-    """Two deterministic Euler sub-steps of the teacher over [t_s, t_s + h], then Eq. (2).
-
-    grid = "fixed"  : interior time is the midpoint.
-    grid = "random" : interior time is uniform in (t_s, t_s + h), sampled per example.
+    random: interior points are sorted logit-normal samples, drawn per example.
+    fixed : interior points are the quantiles i / n_sub of the same distribution.
     """
-    u = torch.full_like(t_s, 0.5) if grid == "fixed" else torch.rand_like(t_s)
-    t_mid = t_s + u * h
-    z_mid = z + (t_mid - t_s) * velocity(teacher, z, t_s)
-    z_end = z_mid + (t_s + h - t_mid) * velocity(teacher, z_mid, t_mid)
-    return z + (1 - t_s) / h * (z_end - z)        # x-target that reaches z_end in one step
+    b = t_s.shape[0]
+    if grid == "random":
+        u = torch.sort(logit_normal(b, n_sub - 1), dim=1).values
+    else:
+        q = torch.arange(1, n_sub) / n_sub
+        u = torch.sigmoid(P_MEAN + P_STD * torch.special.ndtri(q)).expand(b, n_sub - 1)
+    return torch.cat([t_s, t_s + h * u, t_s + h], dim=1)
+
+
+@torch.no_grad()
+def pd_target(teacher, z, t_s, h, n_sub, grid):
+    """n_sub deterministic Euler sub-steps of the teacher over [t_s, t_s + h], then Eq. (2)."""
+    times = sub_step_times(t_s, h, n_sub, grid)
+    z_cur = z
+    for i in range(n_sub):
+        t_cur, t_next = times[:, i:i + 1], times[:, i + 1:i + 2]
+        z_cur = z_cur + (t_next - t_cur) * velocity(teacher, z_cur, t_cur)
+    return z + (1 - t_s) / h * (z_cur - z)        # x-target that reaches z_cur in one step
 
 
 def student_input(n, h):
-    """Forward-noised data at a random start time t_s in [0, 1 - h]."""
+    """Forward-noised data at t_s = u * (1 - h), u logit-normal."""
     x = two_moons(n)
-    t_s = torch.rand(n, 1) * (1 - h)
+    t_s = logit_normal(n, 1) * max(1 - h, 1e-6)
     z = t_s * x + (1 - t_s) * S * torch.randn_like(x)
     return z, t_s
 
 
-def pd_round(teacher, n_student, grid, iters, bs, lr):
-    """One PD round. The student starts from the teacher's weights."""
-    student = copy.deepcopy(teacher)
-    teacher.eval()
+def pd_round(student, teacher, n_student, n_sub, grid, iters, bs, lr):
+    """One PD round: regress the student's x-prediction onto the teacher's PD target."""
     h = 1.0 / n_student
     opt = torch.optim.Adam(student.parameters(), lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters)
     for _ in range(iters):
         z, t_s = student_input(bs, h)
-        target = pd_target(teacher, z, t_s, h, grid)
+        target = pd_target(teacher, z, t_s, h, n_sub, grid)
         loss = (student(z, t_s) - target).pow(2).sum(dim=1).mean()
         opt.zero_grad()
         loss.backward()
@@ -140,16 +153,16 @@ def pd_round(teacher, n_student, grid, iters, bs, lr):
     return student
 
 
-# ----------------------measurements------------------------------------------------ 
+# ----------------------measurements------------------------------------------------
 @torch.no_grad()
-def loss_terms(student, teacher, n_student, grid, n=4096, k=64):
+def loss_terms(student, teacher, n_student, n_sub, grid, n=2048, k=32):
     """Eq. (5) on fresh inputs: loss = approximation error + target noise.
 
     The teacher rollout is repeated k times from the same input.
     """
     h = 1.0 / n_student
     z, t_s = student_input(n, h)
-    targets = torch.stack([pd_target(teacher, z, t_s, h, grid) for _ in range(k)])  # (k, n, 2)
+    targets = torch.stack([pd_target(teacher, z, t_s, h, n_sub, grid) for _ in range(k)])
     pred = student(z, t_s)
     loss = (pred - targets).pow(2).sum(dim=-1).mean().item()
     approx = (pred - targets.mean(dim=0)).pow(2).sum(dim=-1).mean().item()
@@ -166,75 +179,118 @@ def nn_dist(a, b):
 def quality(samples, data):
     """(off-data distance, coverage distance).
 
-    off-data : generated -> nearest data point  (high = samples off the data, low precision)
-    coverage : data -> nearest generated sample (high = data regions missed, low recall)
+    off-data : generated -> nearest data point  (high = samples off the data)
+    coverage : data -> nearest generated sample (high = data regions missed)
     """
     return nn_dist(samples, data), nn_dist(data, samples)
 
 
-# ---------------------------main--------------------------------------------------- 
+@torch.no_grad()
+def teacher_samples(teacher, n, grid):
+    """64 Euler sub-steps from noise: this is the target of the one-step student."""
+    z0 = S * torch.randn(n, 2)
+    return pd_target(teacher, z0, torch.zeros(n, 1), 1.0, TEACHER_SUBSTEPS[-1], grid)
+
+
+@torch.no_grad()
+def one_step_samples(student, n):
+    z0 = S * torch.randn(n, 2)
+    return student(z0, torch.zeros(n, 1))
+
+
+# ---------------------------main---------------------------------------------------
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--teacher_iters", type=int, default=16000)
-    p.add_argument("--pd_iters", type=int, default=3000)
+    p.add_argument("--pd_iters", type=int, default=2000)
     p.add_argument("--long", type=int, default=4, help="longer-training factor for the last round")
-    p.add_argument("--bs", type=int, default=1024)
+    p.add_argument("--bs", type=int, default=512)
     p.add_argument("--n_eval", type=int, default=5000)
+    p.add_argument("--grid", default="both", choices=["both", "random", "fixed", "none"])
+    p.add_argument("--ckpt_dir", default="", help="save / reuse teacher and one-step students here")
     args = p.parse_args()
     torch.manual_seed(args.seed)
 
+    def ckpt(name):
+        return os.path.join(args.ckpt_dir, f"{name}_seed{args.seed}.pt") if args.ckpt_dir else ""
+
     data = two_moons(args.n_eval)
     floor = quality(two_moons(args.n_eval), data)
-    print(f"data vs data          off-data {floor[0]:.3f}  coverage {floor[1]:.3f}")
+    print(f"data vs data               off-data {floor[0]:.3f}  coverage {floor[1]:.3f}", flush=True)
 
-    base = train_teacher(Net(), args.teacher_iters, args.bs, lr=1e-3)
-    q = quality(sample(base, args.n_eval, 32), data)
-    print(f"teacher, 32 steps     off-data {q[0]:.3f}  coverage {q[1]:.3f}")
-    q = quality(sample(base, args.n_eval, 1), data)
-    print(f"teacher,  1 step      off-data {q[0]:.3f}  coverage {q[1]:.3f}")
-
-    one_step = {}
+    base = Net()
+    if ckpt("teacher") and os.path.exists(ckpt("teacher")):
+        base.load_state_dict(torch.load(ckpt("teacher")))
+    else:
+        train_teacher(base, args.teacher_iters, 1024, lr=1e-3)
+        if ckpt("teacher"):
+            torch.save(base.state_dict(), ckpt("teacher"))
+    base.eval()
     for grid in ("random", "fixed"):
+        q = quality(teacher_samples(base, args.n_eval, grid), data)
+        print(f"teacher, 64 sub-steps, {grid:6s} grid  off-data {q[0]:.3f}  coverage {q[1]:.3f}", flush=True)
+    for n_student, n_sub in zip(STUDENT_STEPS, TEACHER_SUBSTEPS):
+        _, _, noise = loss_terms(base, base, n_student, n_sub, "random")
+        print(f"target noise, random grid, {n_student:2d}-step round: {noise:.5f}", flush=True)
+
+    grids = ("random", "fixed") if args.grid == "both" else (() if args.grid == "none" else (args.grid,))
+    trained = {}
+    for grid in grids:
         print(f"\nPD with a {grid} teacher time grid")
-        print("steps   loss    approx  noise   off-data  coverage")
-        teacher = base
-        for n_student in (16, 8, 4, 2, 1):
-            student = pd_round(teacher, n_student, grid, args.pd_iters, args.bs, lr=3e-4)
-            loss, approx, noise = loss_terms(student, teacher, n_student, grid)
-            q = quality(sample(student, args.n_eval, n_student), data)
-            print(f"{n_student:5d}   {loss:.4f}  {approx:.4f}  {noise:.4f}  {q[0]:.3f}     {q[1]:.3f}", flush=True)
-            last_teacher, teacher = teacher, student
-        one_step[grid] = student
+        print("steps   loss     approx   noise", flush=True)
+        student = copy.deepcopy(base)                     # round 1 starts from the teacher
+        for n_student, n_sub in zip(STUDENT_STEPS, TEACHER_SUBSTEPS):
+            before_last = copy.deepcopy(student)
+            student.train()
+            pd_round(student, base, n_student, n_sub, grid, args.pd_iters, args.bs, lr=3e-4)
+            student.eval()
+            loss, approx, noise = loss_terms(student, base, n_student, n_sub, grid)
+            print(f"{n_student:5d}   {loss:.5f}  {approx:.5f}  {noise:.5f}", flush=True)
+        q = quality(one_step_samples(student, args.n_eval), data)
+        print(f"one-step student           off-data {q[0]:.3f}  coverage {q[1]:.3f}", flush=True)
+        trained[grid] = student
+        if ckpt("teacher"):
+            torch.save(student.state_dict(), ckpt(f"student_{grid}"))
 
-        # longer training of the last round, same teacher (random grid only:
-        # with the fixed grid the loss is already close to zero)
-        if grid == "random":
-            student_long = pd_round(last_teacher, 1, grid, args.long * args.pd_iters, args.bs, lr=3e-4)
-            loss, approx, noise = loss_terms(student_long, last_teacher, 1, grid)
-            q = quality(sample(student_long, args.n_eval, 1), data)
-            print(f"1 (x{args.long})  {loss:.4f}  {approx:.4f}  {noise:.4f}  {q[0]:.3f}     {q[1]:.3f}", flush=True)
+        if grid == "random" and args.long > 1:           # longer training of the last round
+            long = before_last
+            long.train()
+            pd_round(long, base, 1, TEACHER_SUBSTEPS[-1], grid, args.long * args.pd_iters, args.bs, lr=3e-4)
+            long.eval()
+            loss, approx, noise = loss_terms(long, base, 1, TEACHER_SUBSTEPS[-1], grid)
+            q = quality(one_step_samples(long, args.n_eval), data)
+            print(f"1 (x{args.long})  {loss:.5f}  {approx:.5f}  {noise:.5f}   off-data {q[0]:.3f}  coverage {q[1]:.3f}",
+                  flush=True)
 
-    # ----------------------Fig. 1-------------------------------------------- 
-    panels = [
-        ("Data", data),
-        ("Teacher, 32 steps", sample(base, args.n_eval, 32)),
-        ("One step, random grid", sample(one_step["random"], args.n_eval, 1)),
-        ("One step, fixed grid", sample(one_step["fixed"], args.n_eval, 1)),
-    ]
-    fig, axes = plt.subplots(1, 4, figsize=(10, 2.6), sharex=True, sharey=True)
-    for ax, (title, pts) in zip(axes, panels):
-        ax.scatter(pts[:, 0], pts[:, 1], s=0.5, alpha=0.5, color="#1f4e79", linewidths=0)
-        ax.set_title(title, fontsize=9)
-        ax.set_xlim(-2.6, 2.6)
-        ax.set_ylim(-1.8, 1.8)
-        ax.set_aspect("equal")
-        ax.set_xticks([])
-        ax.set_yticks([])
-    fig.tight_layout()
-    fig.savefig("fig1_two_moons_pd.png", dpi=300)
-    fig.savefig("fig1_two_moons_pd.pdf")
-    print("\nsaved fig1_two_moons_pd.png / .pdf")
+    # ----------------------Fig. 1--------------------------------------------
+    students = dict(trained)
+    for grid in ("random", "fixed"):
+        if grid not in students and ckpt("teacher") and os.path.exists(ckpt(f"student_{grid}")):
+            net = Net()
+            net.load_state_dict(torch.load(ckpt(f"student_{grid}")))
+            students[grid] = net.eval()
+    if len(students) == 2:
+        panels = [
+            ("Data", data),
+            ("Teacher, random grid", teacher_samples(base, args.n_eval, "random")),
+            ("One step, random grid", one_step_samples(students["random"], args.n_eval)),
+            ("Teacher, fixed grid", teacher_samples(base, args.n_eval, "fixed")),
+            ("One step, fixed grid", one_step_samples(students["fixed"], args.n_eval)),
+        ]
+        fig, axes = plt.subplots(1, 5, figsize=(12.5, 2.6), sharex=True, sharey=True)
+        for ax, (title, pts) in zip(axes, panels):
+            ax.scatter(pts[:, 0], pts[:, 1], s=0.5, alpha=0.5, color="#1f4e79", linewidths=0)
+            ax.set_title(title, fontsize=9)
+            ax.set_xlim(-2.6, 2.6)
+            ax.set_ylim(-1.8, 1.8)
+            ax.set_aspect("equal")
+            ax.set_xticks([])
+            ax.set_yticks([])
+        fig.tight_layout()
+        fig.savefig("fig1_two_moons_pd.png", dpi=300)
+        fig.savefig("fig1_two_moons_pd.pdf")
+        print("\nsaved fig1_two_moons_pd.png / .pdf")
 
 
 if __name__ == "__main__":

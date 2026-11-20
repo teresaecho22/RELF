@@ -29,7 +29,7 @@ S = 1.0        # noise scale s. ELF uses s = 2 in the denoising branch; 1 is eno
 T_EPS = 0.05   # lower bound on (1 - t) in the velocity, as in ELF's code (t_eps)
 
 
-# ----------------------------------------------------------------------------- data
+# --------------------------------data--------------------------------------------- 
 def two_moons(n, noise=0.05):
     """n points from the two-moons distribution, centered and scaled to std ~ 1."""
     n_up = n // 2
@@ -41,7 +41,7 @@ def two_moons(n, noise=0.05):
     return (x - torch.tensor([0.5, 0.25])) / 0.7
 
 
-# ---------------------------------------------------------------------------- model
+# --------------------------------model-------------------------------------------- 
 class Net(nn.Module):
     """x-prediction network: (z_t, t) -> x_hat."""
 
@@ -65,7 +65,7 @@ def velocity(net, z, t):
     return (net(z, t) - z) / (1 - t).clamp(min=T_EPS)
 
 
-# ------------------------------------------------------------------ teacher training
+# ---------------------------teacher training--------------------------------------- 
 def train_teacher(net, iters, bs, lr):
     """Flow matching loss of Eq. (1): || v_theta(z_t, t) - (x - s eps) ||^2."""
     opt = torch.optim.Adam(net.parameters(), lr=lr)
@@ -94,7 +94,7 @@ def sample(net, n, steps):
     return z
 
 
-# ---------------------------------------------------------------------- distillation
+# -----------------------distillation----------------------------------------------- 
 @torch.no_grad()
 def pd_target(teacher, z, t_s, h, grid):
     """Two deterministic Euler sub-steps of the teacher over [t_s, t_s + h], then Eq. (2).
@@ -135,7 +135,7 @@ def pd_round(teacher, n_student, grid, iters, bs, lr):
     return student
 
 
-# ---------------------------------------------------------------------- measurements
+# ----------------------measurements------------------------------------------------ 
 @torch.no_grad()
 def loss_terms(student, teacher, n_student, grid, n=4096, k=64):
     """Eq. (5) on fresh inputs: loss = approximation error + target noise.
@@ -167,7 +167,7 @@ def quality(samples, data):
     return nn_dist(samples, data), nn_dist(data, samples)
 
 
-# ------------------------------------------------------------------------------ main
+# ---------------------------main--------------------------------------------------- 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--seed", type=int, default=0)
@@ -208,7 +208,7 @@ def main():
         q = quality(sample(student_long, args.n_eval, 1), data)
         print(f"1 (x{args.long})  {loss:.4f}  {approx:.4f}  {noise:.4f}  {q[0]:.3f}     {q[1]:.3f}")
 
-    # ------------------------------------------------------------------ Fig. 1
+    # ----------------------Fig. 1-------------------------------------------- 
     panels = [
         ("Data", data),
         ("Teacher, 32 steps", sample(base, args.n_eval, 32)),
